@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace od {
@@ -10,6 +11,26 @@ struct EncodedFrame {
     std::vector<uint8_t> annexB; // one full access unit, 4-byte start codes, SPS/PPS ensured on IDR
     bool isKeyFrame = false;
 };
+
+struct EncoderDiagnostics {
+    std::wstring name;
+    bool hardware = false;
+    bool asynchronous = false;
+    bool colorSignalingVerified = false;
+    uint64_t inputFrames = 0;
+    uint64_t outputFrames = 0;
+    uint64_t outputBytes = 0;
+    uint64_t spsChecked = 0;
+    uint64_t spsRewritten = 0;
+    uint64_t spsRejected = 0;
+    double lastCopyMs = -1.0;
+    double lastEncodeCallMs = -1.0;
+    // Submit -> matching encoded output, excluding capture and transport.
+    // Negative if the transform did not return a matching sample timestamp.
+    double lastOutputDelayMs = -1.0;
+};
+
+enum class EncoderPreference { PreferHardware, SoftwareOnly };
 
 // Wraps a Media Foundation H.264 encoder MFT (hardware NVENC/QuickSync/AMF if
 // available, software fallback otherwise — spec §7c). Handles both
@@ -25,7 +46,8 @@ public:
 
     // (Re)configures the encoder for the given frame size. bitrateBps default
     // sits in the 20-40 Mbit/s range recommended for a local, low-latency link.
-    bool Configure(uint32_t width, uint32_t height, uint32_t fps = 60, uint32_t bitrateBps = 30'000'000);
+    bool Configure(uint32_t width, uint32_t height, uint32_t fps = 60, uint32_t bitrateBps = 30'000'000,
+                   EncoderPreference preference = EncoderPreference::PreferHardware);
 
     // Encodes one NV12 frame (size must be width*height*3/2 bytes). May
     // return zero access units (encoder still warming up / buffering) or,
@@ -43,6 +65,10 @@ public:
     // from Windows instead of from the receiver's `hello`.
     uint32_t Width() const;
     uint32_t Height() const;
+    // Cumulative since Configure; caller uses the same pipeline lock as
+    // EncodeNv12. Output deltas allow measuring real FPS independently of
+    // the requested frame rate and asynchronous ProcessInput call duration.
+    EncoderDiagnostics Diagnostics() const;
 
 private:
     struct Impl;

@@ -1,4 +1,5 @@
 #include "display/DesktopDuplication.h"
+#include "encode/VideoColor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,60 +21,9 @@ namespace {
 // path, not on errors.
 constexpr int kRecoveryBackoffMs = 100;
 
-inline uint8_t Clamp8(int v)
+double ElapsedMs(std::chrono::steady_clock::time_point start)
 {
-    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
-}
-
-// BT.601 studio-range BGRA -> NV12. CPU-side; fine for a local-link sender,
-// not optimized (a GPU color-convert MFT would be the follow-up if this
-// turns out to be the bottleneck).
-void ConvertBgraToNv12(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint32_t height, std::vector<uint8_t>& nv12)
-{
-    nv12.resize(static_cast<size_t>(width) * height * 3 / 2);
-    uint8_t* yPlane = nv12.data();
-    uint8_t* uvPlane = nv12.data() + static_cast<size_t>(width) * height;
-
-    for (uint32_t row = 0; row < height; ++row) {
-        const uint8_t* srcRow = bgra + static_cast<size_t>(row) * rowPitch;
-        uint8_t* yRow = yPlane + static_cast<size_t>(row) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-            const uint8_t* px = srcRow + static_cast<size_t>(col) * 4; // B G R A
-            int b = px[0], g = px[1], r = px[2];
-            int y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            yRow[col] = Clamp8(y);
-        }
-    }
-
-    for (uint32_t row = 0; row < height; row += 2) {
-        const uint8_t* srcRow0 = bgra + static_cast<size_t>(row) * rowPitch;
-        const uint8_t* srcRow1 = bgra + static_cast<size_t>(std::min(row + 1, height - 1)) * rowPitch;
-        uint8_t* uvRow = uvPlane + static_cast<size_t>(row / 2) * width;
-
-        for (uint32_t col = 0; col < width; col += 2) {
-            uint32_t col1 = std::min(col + 1, width - 1);
-
-            auto sample = [](const uint8_t* rowPtr, uint32_t c, int& r, int& g, int& b) {
-                const uint8_t* px = rowPtr + static_cast<size_t>(c) * 4;
-                b = px[0];
-                g = px[1];
-                r = px[2];
-            };
-
-            int r, g, b, sr = 0, sg = 0, sb = 0;
-            sample(srcRow0, col, r, g, b); sr += r; sg += g; sb += b;
-            sample(srcRow0, col1, r, g, b); sr += r; sg += g; sb += b;
-            sample(srcRow1, col, r, g, b); sr += r; sg += g; sb += b;
-            sample(srcRow1, col1, r, g, b); sr += r; sg += g; sb += b;
-            r = sr / 4; g = sg / 4; b = sb / 4;
-
-            int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-            int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-
-            uvRow[col] = Clamp8(u);
-            uvRow[col1] = Clamp8(v);
-        }
-    }
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 } // namespace
@@ -147,6 +97,7 @@ bool DesktopDuplication::Reopen()
 
 bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs)
 {
+    timings_ = {};
     // The duplication may have been torn down by an earlier frame (topology
     // change, access loss). Try to rebuild before giving up — and if it still
     // can't be rebuilt (desktop mid-reconfigure), back off briefly and drop
@@ -160,7 +111,9 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
 
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> resource;
+    const auto waitStarted = std::chrono::steady_clock::now();
     HRESULT hr = duplication_->AcquireNextFrame(timeoutMs, &info, &resource);
+    timings_.waitMs = ElapsedMs(waitStarted);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT)
         return false;
     if (FAILED(hr)) {
@@ -229,19 +182,28 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
         }
     }
 
+    const auto readbackStarted = std::chrono::steady_clock::now();
     context_->CopyResource(staging_.Get(), texture.Get());
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
+    timings_.readbackMs = ElapsedMs(readbackStarted);
+    bool converted = false;
     if (SUCCEEDED(hr)) {
+        const auto cursorStarted = std::chrono::steady_clock::now();
         if (pointerVisible_ && !pointerShape_.empty())
             CompositePointer(reinterpret_cast<uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH);
-        ConvertBgraToNv12(reinterpret_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH, nv12);
+        timings_.cursorMs = ElapsedMs(cursorStarted);
+        const auto conversionStarted = std::chrono::steady_clock::now();
+        converted = ConvertBgraToBt709Nv12(reinterpret_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+                                        frameW, frameH, nv12);
+        timings_.conversionMs = ElapsedMs(conversionStarted);
         context_->Unmap(staging_.Get(), 0);
     }
 
     duplication_->ReleaseFrame();
-    return SUCCEEDED(hr);
+    timings_.frameCaptured = converted;
+    return converted;
 }
 
 void DesktopDuplication::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info)

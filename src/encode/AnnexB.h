@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <vector>
 
@@ -29,6 +30,30 @@ std::vector<NalUnit> ScanStartCodes(const uint8_t* data, size_t size);
 // normalized 4-byte start code (00 00 00 01) — this is the exact byte layout
 // sent as one framed video message (spec §4 rules 1-2).
 std::vector<uint8_t> BuildAccessUnit(const std::vector<NalUnit>& nals);
+
+struct SpsColorInfo {
+    bool vuiPresent = false;
+    bool videoSignalPresent = false;
+    bool colorDescriptionPresent = false;
+    bool fullRange = false;
+    uint8_t primaries = 0;
+    uint8_t transfer = 0;
+    uint8_t matrix = 0;
+
+    bool IsBt709Limited() const
+    {
+        return videoSignalPresent && colorDescriptionPresent && !fullRange &&
+               primaries == 1 && transfer == 1 && matrix == 1;
+    }
+};
+
+// Reads the actual emitted SPS, not just the MFT's requested media type.
+// Invalid/truncated bitstreams return nullopt without modifying their input.
+std::optional<SpsColorInfo> InspectSpsColor(const NalUnit& sps);
+enum class SpsColorResult { Unchanged, Updated, Invalid };
+// Corrects only video_signal_type in VUI (inserting VUI when absent). Coded
+// picture data, geometry, timing and all other SPS fields are preserved.
+SpsColorResult EnsureSpsBt709Limited(NalUnit& sps);
 
 // Tracks the most recently seen SPS/PPS and prepends them to any access unit
 // that contains an IDR slice but doesn't already have its own SPS+PPS

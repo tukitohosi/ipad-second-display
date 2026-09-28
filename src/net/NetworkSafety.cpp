@@ -7,6 +7,8 @@
 #include <netlistmgr.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <chrono>
 #include <vector>
 
 namespace od {
@@ -34,16 +36,12 @@ struct ResolvedAddress {
     std::string numeric;
 };
 
-bool ResolveTarget(const std::string& target, std::vector<ResolvedAddress>& addresses)
+template <typename AddressInfo>
+void AppendResolvedAddresses(const AddressInfo* result, std::vector<ResolvedAddress>& addresses)
 {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    addrinfo* result = nullptr;
-    if (getaddrinfo(target.c_str(), nullptr, &hints, &result) != 0) return false;
-    for (addrinfo* item = result; item != nullptr; item = item->ai_next) {
+    for (const AddressInfo* item = result; item != nullptr; item = item->ai_next) {
         if (item->ai_family != AF_INET && item->ai_family != AF_INET6) continue;
+        if (item->ai_addr == nullptr || item->ai_addrlen > sizeof(sockaddr_storage)) continue;
         ResolvedAddress resolved;
         resolved.length = static_cast<int>(item->ai_addrlen);
         std::memcpy(&resolved.storage, item->ai_addr, item->ai_addrlen);
@@ -54,7 +52,84 @@ bool ResolveTarget(const std::string& target, std::vector<ResolvedAddress>& addr
             addresses.push_back(std::move(resolved));
         }
     }
-    freeaddrinfo(result);
+}
+
+bool ResolveTarget(const std::string& target, std::vector<ResolvedAddress>& addresses,
+                   const std::atomic<bool>* stopRequested, int timeoutMs, std::string& failure)
+{
+    auto stopped = [&] { return stopRequested && stopRequested->load(); };
+    if (stopped()) { failure = "address lookup cancelled"; return false; }
+    if (target.empty()) { failure = "target address is empty"; return false; }
+
+    addrinfo numericHints{};
+    numericHints.ai_family = AF_UNSPEC;
+    numericHints.ai_socktype = SOCK_STREAM;
+    numericHints.ai_protocol = IPPROTO_TCP;
+    numericHints.ai_flags = AI_NUMERICHOST;
+    addrinfo* numeric = nullptr;
+    if (getaddrinfo(target.c_str(), nullptr, &numericHints, &numeric) == 0) {
+        AppendResolvedAddresses(numeric, addresses);
+        freeaddrinfo(numeric);
+        if (stopped()) { failure = "address lookup cancelled"; addresses.clear(); return false; }
+        return !addresses.empty();
+    }
+    if (numeric) freeaddrinfo(numeric);
+
+    const int budget = (std::clamp)(timeoutMs, 0, 2000);
+    if (budget == 0) { failure = "address lookup timed out"; return false; }
+    const int wideLength = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, target.c_str(),
+                                               static_cast<int>(target.size()), nullptr, 0);
+    if (wideLength <= 0) { failure = "target address is not valid UTF-8"; return false; }
+    std::wstring name(static_cast<size_t>(wideLength), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, target.c_str(), static_cast<int>(target.size()),
+                        name.data(), wideLength);
+
+    HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!completed) { failure = "address lookup event could not be created"; return false; }
+    OVERLAPPED operation{};
+    operation.hEvent = completed;
+    HANDLE cancellation = nullptr;
+    ADDRINFOEXW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    PADDRINFOEXW result = nullptr;
+    timeval queryTimeout{};
+    queryTimeout.tv_sec = budget / 1000;
+    queryTimeout.tv_usec = (budget % 1000) * 1000;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
+    int error = GetAddrInfoExW(name.c_str(), nullptr, NS_DNS, nullptr, &hints, &result,
+                               &queryTimeout, &operation, nullptr, &cancellation);
+    if (error == WSA_IO_PENDING) {
+        for (;;) {
+            if (WaitForSingleObject(completed, 0) == WAIT_OBJECT_0) break;
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (stopped() || remaining <= 0) {
+                failure = stopped() ? "address lookup cancelled" : "address lookup timed out";
+                GetAddrInfoExCancel(&cancellation);
+                // Windows signals the completion mechanism on cancellation.
+                // Never release stack-backed OVERLAPPED/result storage before
+                // that signal, even when completion raced with cancellation.
+                WaitForSingleObject(completed, INFINITE);
+                break;
+            }
+            const DWORD wait = WaitForSingleObject(completed, static_cast<DWORD>((std::min)(remaining, int64_t{50})));
+            if (wait == WAIT_OBJECT_0) break;
+            if (wait == WAIT_FAILED) {
+                failure = "address lookup wait failed";
+                GetAddrInfoExCancel(&cancellation);
+                WaitForSingleObject(completed, INFINITE);
+                break;
+            }
+        }
+        error = GetAddrInfoExOverlappedResult(&operation);
+    }
+    if (stopped()) failure = "address lookup cancelled";
+    if (error == NO_ERROR && failure.empty()) AppendResolvedAddresses(result, addresses);
+    if (result) FreeAddrInfoExW(result);
+    CloseHandle(completed);
+    if (addresses.empty() && failure.empty()) failure = "target could not be resolved to IPv4 or IPv6";
     return !addresses.empty();
 }
 
@@ -131,11 +206,13 @@ bool HasTrustedWindowsNetwork(const ResolvedAddress& target)
 
 } // namespace
 
-NetworkSafetyResult CheckTrustedLan(const std::string& target, bool requirePrivateNetwork)
+NetworkSafetyResult CheckTrustedLan(const std::string& target, bool requirePrivateNetwork,
+                                    const std::atomic<bool>* stopRequested, int timeoutMs)
 {
     std::vector<ResolvedAddress> addresses;
-    if (!ResolveTarget(target, addresses))
-        return {false, "target could not be resolved to IPv4 or IPv6"};
+    std::string resolutionFailure;
+    if (!ResolveTarget(target, addresses, stopRequested, timeoutMs, resolutionFailure))
+        return {false, resolutionFailure.empty() ? "target could not be resolved to IPv4 or IPv6" : resolutionFailure, {}, true};
     if (!requirePrivateNetwork)
         return {true, "private-network enforcement disabled by explicit configuration", addresses.front().numeric};
 

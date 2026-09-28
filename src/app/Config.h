@@ -22,6 +22,13 @@ enum class StreamProfile : uint32_t {
     Custom = 3,
 };
 
+struct MacBinding {
+    std::string mac;
+    std::string networkScope; // NLM network GUID + adapter GUID, never just an interface index
+
+    bool operator==(const MacBinding&) const = default;
+};
+
 struct DeviceConfig {
     std::string id;                 // OpenDisplay install id (hello.id / Bonjour TXT id)
     std::string name;
@@ -33,6 +40,8 @@ struct DeviceConfig {
     bool autoConnect = true;
     int64_t lastSeen = 0;           // Unix seconds; informational only
     std::string macHint;            // diagnostics only, never a socket endpoint
+    bool macMatchingEnabled = true;
+    std::vector<MacBinding> macBindings; // learned only after a verified successful session
 
     bool operator==(const DeviceConfig&) const = default;
 };
@@ -40,7 +49,7 @@ struct DeviceConfig {
 // User settings, persisted as JSON at %APPDATA%\MouseLink\config.json.
 // Flat and tiny — hand-rolled JSON, no dependency.
 struct Config {
-    static constexpr uint32_t CurrentVersion = 2;
+    static constexpr uint32_t CurrentVersion = 3;
     uint32_t version = CurrentVersion;
     // Stored in priority order. Legacy string entries and the old single `ip`
     // field are migrated without discarding the address or friendly name.
@@ -51,8 +60,8 @@ struct Config {
     uint32_t bitrateMbps = 30;
     StreamProfile streamProfile = StreamProfile::Balanced;
     bool requirePrivateNetwork = true;
-    bool showLauncher = true;
-    LauncherMode launcherMode = LauncherMode::Fullscreen;
+    bool showLauncher = false;
+    LauncherMode launcherMode = LauncherMode::Hidden;
     bool darkTheme = false;
     bool taskbarRouting = false;
     std::string preferredDeviceId;

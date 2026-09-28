@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -33,7 +34,23 @@ std::wstring AppDataBase()
     return base;
 }
 
-std::wstring AppDataDir() { return AppDataBase() + L"\\MouseLink"; }
+std::wstring ConfigOverrideDir()
+{
+    wchar_t* value = nullptr;
+    size_t length = 0;
+    std::wstring result;
+    if (_wdupenv_s(&value, &length, L"IPAD_CONNECT_CONFIG_DIR") == 0 && value) {
+        if (std::filesystem::path(value).is_absolute()) result = value;
+        free(value);
+    }
+    return result;
+}
+
+std::wstring AppDataDir()
+{
+    const std::wstring overrideDir = ConfigOverrideDir();
+    return overrideDir.empty() ? AppDataBase() + L"\\MouseLink" : overrideDir;
+}
 std::wstring LegacyConfigPath() { return AppDataBase() + L"\\opendisplay-win\\config.json"; }
 
 struct Json {
@@ -208,6 +225,7 @@ bool TryParseConfig(std::string_view json, Config& cfg)
     int64_t number = 0;
     const bool hasVersion = IntField(*object, "version", number);
     if (hasVersion && number > 0 && number <= UINT32_MAX) parsed.version = static_cast<uint32_t>(number);
+    const bool migrateNativeDesktop = !hasVersion || number < 3;
     if (IntField(*object, "port", number) && number > 0 && number <= 65535) parsed.port = static_cast<uint16_t>(number);
 
     const Json* devices = Field(*object, "devices");
@@ -223,6 +241,19 @@ bool TryParseConfig(std::string_view json, Config& cfg)
             device.id = StringField(*deviceObject, "id"); device.name = StringField(*deviceObject, "name");
             device.lastIpv4 = StringField(*deviceObject, "lastIpv4"); device.bonjourHost = StringField(*deviceObject, "bonjourHost");
             device.preferredTransport = StringField(*deviceObject, "preferredTransport"); device.macHint = StringField(*deviceObject, "macHint");
+            BoolField(*deviceObject, "macMatchingEnabled", device.macMatchingEnabled);
+            // Historical macHint values were arbitrary diagnostics, never consent or identity evidence.
+            if (!migrateNativeDesktop && !device.id.empty()) {
+                const Json* bindings = Field(*deviceObject, "macBindings");
+                if (bindings) if (const auto* entries = std::get_if<Json::Array>(&bindings->value)) {
+                    for (const Json& entry : *entries) {
+                        const auto* bindingObject = std::get_if<Json::Object>(&entry.value);
+                        if (!bindingObject || device.macBindings.size() >= 8) continue;
+                        MacBinding binding{StringField(*bindingObject, "mac"), StringField(*bindingObject, "networkScope")};
+                        if (!binding.mac.empty() && !binding.networkScope.empty()) device.macBindings.push_back(std::move(binding));
+                    }
+                }
+            }
             if (IntField(*deviceObject, "port", number) && number > 0 && number <= 65535) device.port = static_cast<uint16_t>(number); else device.port = parsed.port;
             if (IntField(*deviceObject, "priority", number) && number >= 0 && number <= UINT32_MAX) device.priority = static_cast<uint32_t>(number); else device.priority = static_cast<uint32_t>(parsed.devices.size());
             BoolField(*deviceObject, "autoConnect", device.autoConnect);
@@ -258,8 +289,12 @@ bool TryParseConfig(std::string_view json, Config& cfg)
     else parsed.launcherMode = parsed.showLauncher ? LauncherMode::Fullscreen : LauncherMode::Hidden;
     parsed.showLauncher = parsed.launcherMode != LauncherMode::Hidden;
     BoolField(*object, "darkTheme", parsed.darkTheme);
-    // Pre-v2 files inherited the historical enabled default if the field was absent.
-    if (!BoolField(*object, "taskbarRouting", parsed.taskbarRouting) && !hasVersion) parsed.taskbarRouting = true;
+    BoolField(*object, "taskbarRouting", parsed.taskbarRouting);
+    if (migrateNativeDesktop) {
+        parsed.showLauncher = false;
+        parsed.launcherMode = LauncherMode::Hidden;
+        parsed.taskbarRouting = false;
+    }
     parsed.preferredDeviceId = StringField(*object, "preferredDeviceId");
     parsed.lastConnectionTransport = StringField(*object, "lastConnectionTransport");
     parsed.lastWifiAddress = StringField(*object, "lastWifiAddress");
@@ -287,6 +322,7 @@ Config Config::Load()
     const std::wstring path = FilePath();
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
         return LoadFromFile(path);
+    if (!ConfigOverrideDir().empty()) return {}; // an isolated test must never migrate real user data
     if (GetFileAttributesW(LegacyConfigPath().c_str()) == INVALID_FILE_ATTRIBUTES)
         return {};
     Config cfg = LoadFromFile(LegacyConfigPath());
@@ -325,7 +361,14 @@ std::string Config::Serialize() const
              << "\",\"lastIpv4\":\"" << EscapeJson(d.lastIpv4) << "\",\"bonjourHost\":\"" << EscapeJson(d.bonjourHost)
              << "\",\"port\":" << d.port << ",\"preferredTransport\":\"" << EscapeJson(d.preferredTransport)
              << "\",\"priority\":" << i << ",\"autoConnect\":" << (d.autoConnect ? "true" : "false")
-             << ",\"lastSeen\":" << d.lastSeen << ",\"macHint\":\"" << EscapeJson(d.macHint) << "\"}";
+             << ",\"lastSeen\":" << d.lastSeen << ",\"macHint\":\"" << EscapeJson(d.macHint)
+             << "\",\"macMatchingEnabled\":" << (d.macMatchingEnabled ? "true" : "false") << ",\"macBindings\":[";
+        for (size_t j = 0; j < d.macBindings.size(); ++j) {
+            const auto& binding = d.macBindings[j];
+            file << (j == 0 ? "" : ",") << "{\"mac\":\"" << EscapeJson(binding.mac)
+                 << "\",\"networkScope\":\"" << EscapeJson(binding.networkScope) << "\"}";
+        }
+        file << "]}";
     }
     if (!devices.empty()) file << '\n';
     file << "  ],\n  \"port\": " << port

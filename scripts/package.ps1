@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$')]
-    [string]$Version = '0.2.0',
+    [string]$Version = '0.3.0-preview',
 
     [string]$ExePath,
 
@@ -230,16 +230,17 @@ $sourceStageDir = [IO.Path]::GetFullPath((Join-Path $distDir 'source-stage'))
 $stagedExe = Join-Path $stageDir 'iPad互联.exe'
 $sourceArchiveName = "iPad互联-source-$Version.zip"
 $sourceArchive = [IO.Path]::GetFullPath((Join-Path $distDir $sourceArchiveName))
-$portableExe = [IO.Path]::GetFullPath((Join-Path $distDir 'iPad互联.exe'))
-$installerOutput = [IO.Path]::GetFullPath((Join-Path $distDir 'iPad互联-Setup-x64.exe'))
-$hashOutput = [IO.Path]::GetFullPath((Join-Path $distDir 'SHA256SUMS.txt'))
+$portableExe = [IO.Path]::GetFullPath((Join-Path $distDir "iPad互联-$Version-portable.exe"))
+$installerOutput = [IO.Path]::GetFullPath((Join-Path $distDir "iPad互联-$Version-Setup-x64.exe"))
+$hashOutput = [IO.Path]::GetFullPath((Join-Path $distDir "SHA256SUMS-$Version.txt"))
 
 Remove-OutputPath -Path $stageDir
 Remove-OutputPath -Path $sourceStageDir
-Remove-OutputPath -Path $sourceArchive
-Remove-OutputPath -Path $portableExe
-Remove-OutputPath -Path $installerOutput
-Remove-OutputPath -Path $hashOutput
+foreach ($artifactPath in @($sourceArchive, $portableExe, $installerOutput, $hashOutput)) {
+    if (Test-Path -LiteralPath $artifactPath) {
+        throw "Refusing to overwrite an existing versioned release artifact: $artifactPath"
+    }
+}
 
 try {
     [IO.Directory]::CreateDirectory($stageDir) | Out-Null
@@ -292,6 +293,8 @@ try {
         'CMakePresets.json',
         'LICENSE',
         'README.md',
+        'README.en.md',
+        'RELEASE_NOTES.md',
         'ROADMAP.md',
         'THIRD_PARTY_NOTICES.txt',
         '.gitattributes',
@@ -355,7 +358,7 @@ try {
     $artifacts = @($portableExe, $sourceArchive)
     if (-not $SkipInstaller) {
         $iscc = Resolve-Iscc -RequestedPath $IsccPath
-        & $iscc "/DMyAppVersion=$Version" "/O$distDir" "/FiPad互联-Setup-x64" $installerScript
+        & $iscc "/DMyAppVersion=$Version" "/O$distDir" "/FiPad互联-$Version-Setup-x64" $installerScript
         if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup failed with exit code $LASTEXITCODE."
         }

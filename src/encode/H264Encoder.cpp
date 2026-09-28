@@ -2,6 +2,10 @@
 #include "encode/AnnexB.h"
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <deque>
+#include <iterator>
 #include <codecapi.h>
 #include <icodecapi.h>
 #include <mfapi.h>
@@ -22,6 +26,21 @@ using Microsoft::WRL::ComPtr;
 namespace od {
 
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+double ElapsedMs(SteadyClock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(SteadyClock::now() - start).count();
+}
+
+void SetBt709Limited(IMFMediaType* type)
+{
+    type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+    type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+}
 
 // Best-effort ICodecAPI setter — hardware MFTs don't all support every knob,
 // and that's fine (we only require the resulting *behavior*, not every switch).
@@ -67,6 +86,8 @@ struct H264Encoder::Impl {
     bool configured = false;
     std::atomic<bool> forceKeyFrame{false};
     SpsPpsCache spsPpsCache;
+    EncoderDiagnostics diagnostics;
+    std::deque<std::pair<LONGLONG, SteadyClock::time_point>> submitted;
 
     HRESULT comInitResult = S_FALSE;
 
@@ -87,6 +108,15 @@ struct H264Encoder::Impl {
 
         mft.Reset();
         hr = activates[0]->ActivateObject(IID_PPV_ARGS(mft.ReleaseAndGetAddressOf()));
+        if (SUCCEEDED(hr)) {
+            wchar_t* name = nullptr;
+            UINT32 nameLength = 0;
+            if (SUCCEEDED(activates[0]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nameLength))) {
+                diagnostics.name.assign(name, nameLength);
+                CoTaskMemFree(name);
+            }
+            diagnostics.hardware = hardware;
+        }
         for (UINT32 i = 0; i < count; ++i)
             activates[i]->Release();
         CoTaskMemFree(activates);
@@ -123,6 +153,24 @@ struct H264Encoder::Impl {
         if (nals.empty())
             return;
 
+        for (auto& nal : nals) {
+            if (nal.type != kNalTypeSps)
+                continue;
+            ++diagnostics.spsChecked;
+            const SpsColorResult result = EnsureSpsBt709Limited(nal);
+            if (result == SpsColorResult::Invalid) {
+                ++diagnostics.spsRejected;
+                diagnostics.colorSignalingVerified = false;
+                forceKeyFrame = true;
+                return; // never send a parameter set we could not validate
+            }
+            if (result == SpsColorResult::Updated)
+                ++diagnostics.spsRewritten;
+            diagnostics.colorSignalingVerified = true;
+        }
+        if (!diagnostics.colorSignalingVerified)
+            return;
+
         auto fixedNals = spsPpsCache.EnsureParameterSets(nals);
 
         bool isKeyFrame = false;
@@ -136,6 +184,19 @@ struct H264Encoder::Impl {
         EncodedFrame frame;
         frame.annexB = BuildAccessUnit(fixedNals);
         frame.isKeyFrame = isKeyFrame;
+        ++diagnostics.outputFrames;
+        diagnostics.outputBytes += frame.annexB.size();
+        diagnostics.lastOutputDelayMs = -1.0;
+        LONGLONG sampleTime = 0;
+        if (SUCCEEDED(sample->GetSampleTime(&sampleTime))) {
+            auto input = std::find_if(submitted.begin(), submitted.end(), [&](const auto& entry) {
+                return entry.first == sampleTime;
+            });
+            if (input != submitted.end()) {
+                diagnostics.lastOutputDelayMs = ElapsedMs(input->second);
+                submitted.erase(submitted.begin(), std::next(input));
+            }
+        }
         out.push_back(std::move(frame));
     }
 
@@ -218,9 +279,26 @@ struct H264Encoder::Impl {
         }
         pendingNeedInput = false;
 
-        mft->ProcessInput(0, sample, 0);
+        Submit(sample);
 
         DrainAvailableAsync(out);
+    }
+
+    bool Submit(IMFSample* sample)
+    {
+        const auto started = SteadyClock::now();
+        if (FAILED(mft->ProcessInput(0, sample, 0)))
+            return false;
+        ++diagnostics.inputFrames;
+        LONGLONG sampleTime = 0;
+        if (SUCCEEDED(sample->GetSampleTime(&sampleTime))) {
+            submitted.emplace_back(sampleTime, started);
+            // An unhealthy transform must not make diagnostic bookkeeping
+            // grow without bound. This does not queue or drop video samples.
+            if (submitted.size() > 240)
+                submitted.pop_front();
+        }
+        return true;
     }
 
     void DrainSync(std::vector<EncodedFrame>& out)
@@ -242,17 +320,25 @@ H264Encoder::~H264Encoder()
         impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
-    impl_->mft.Reset();
+    // ICodecAPI is another reference to the transform. Releasing it only
+    // when Impl is destroyed (after MFShutdown/CoUninitialize below) leaves
+    // the hardware encoder alive across Media Foundation teardown.
+    impl_->codecApi.Reset();
     impl_->eventGen.Reset();
+    impl_->mft.Reset();
 
     MFShutdown();
     if (impl_->comInitResult == S_OK || impl_->comInitResult == S_FALSE)
         CoUninitialize();
 }
 
-bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrateBps)
+bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrateBps,
+                            EncoderPreference preference)
 {
     impl_->configured = false;
+    if (width == 0 || height == 0 || (width & 1u) || (height & 1u) || fps == 0 ||
+        static_cast<uint64_t>(width) * height > static_cast<uint64_t>(MAXDWORD) * 2 / 3)
+        return false;
     impl_->width = width;
     impl_->height = height;
     impl_->fps = fps;
@@ -260,8 +346,12 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
     impl_->timestamp = 0;
     impl_->pendingNeedInput = false;
     impl_->spsPpsCache = SpsPpsCache{};
+    impl_->diagnostics = {};
+    impl_->submitted.clear();
+    impl_->eventGen.Reset();
 
-    if (!impl_->CreateTransform(/*hardware=*/true) && !impl_->CreateTransform(/*hardware=*/false))
+    if (!(preference == EncoderPreference::PreferHardware && impl_->CreateTransform(/*hardware=*/true)) &&
+        !impl_->CreateTransform(/*hardware=*/false))
         return false;
 
     ComPtr<IMFAttributes> attrs;
@@ -270,6 +360,7 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
         UINT32 async = 0;
         attrs->GetUINT32(MF_TRANSFORM_ASYNC, &async);
         impl_->isAsync = (async != 0);
+        impl_->diagnostics.asynchronous = impl_->isAsync;
         if (impl_->isAsync) {
             attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             impl_->mft.As(&impl_->eventGen);
@@ -286,6 +377,7 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
     MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, fps, 1);
     MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    SetBt709Limited(outType.Get());
 
     if (FAILED(impl_->mft->SetOutputType(0, outType.Get(), 0)))
         return false;
@@ -298,6 +390,7 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
     MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, fps, 1);
     MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    SetBt709Limited(inType.Get());
 
     if (FAILED(impl_->mft->SetInputType(0, inType.Get(), 0)))
         return false;
@@ -328,24 +421,32 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
 
 std::vector<EncodedFrame> H264Encoder::EncodeNv12(const uint8_t* nv12, size_t size)
 {
+    const auto callStarted = SteadyClock::now();
+    impl_->diagnostics.lastCopyMs = -1.0;
+    impl_->diagnostics.lastEncodeCallMs = -1.0;
     std::vector<EncodedFrame> outFrames;
-    if (!impl_->configured)
+    if (!impl_->configured || nv12 == nullptr)
         return outFrames;
 
-    DWORD expected = impl_->width * impl_->height * 3 / 2;
+    DWORD expected = static_cast<DWORD>(static_cast<uint64_t>(impl_->width) * impl_->height * 3 / 2);
     if (size < expected)
         return outFrames;
 
+    const auto copyStarted = SteadyClock::now();
     ComPtr<IMFMediaBuffer> buffer;
-    MFCreateMemoryBuffer(expected, &buffer);
+    if (FAILED(MFCreateMemoryBuffer(expected, &buffer)))
+        return outFrames;
     BYTE* dst = nullptr;
-    buffer->Lock(&dst, nullptr, nullptr);
+    if (FAILED(buffer->Lock(&dst, nullptr, nullptr)))
+        return outFrames;
     memcpy(dst, nv12, expected);
     buffer->Unlock();
     buffer->SetCurrentLength(expected);
+    impl_->diagnostics.lastCopyMs = ElapsedMs(copyStarted);
 
     ComPtr<IMFSample> sample;
-    MFCreateSample(&sample);
+    if (FAILED(MFCreateSample(&sample)))
+        return outFrames;
     sample->AddBuffer(buffer.Get());
     sample->SetSampleTime(impl_->timestamp);
     sample->SetSampleDuration(impl_->frameDuration100ns);
@@ -358,10 +459,11 @@ std::vector<EncodedFrame> H264Encoder::EncodeNv12(const uint8_t* nv12, size_t si
     if (impl_->isAsync) {
         impl_->PumpAsync(sample.Get(), outFrames);
     } else {
-        if (SUCCEEDED(impl_->mft->ProcessInput(0, sample.Get(), 0)))
+        if (impl_->Submit(sample.Get()))
             impl_->DrainSync(outFrames);
     }
 
+    impl_->diagnostics.lastEncodeCallMs = ElapsedMs(callStarted);
     return outFrames;
 }
 
@@ -383,6 +485,11 @@ uint32_t H264Encoder::Width() const
 uint32_t H264Encoder::Height() const
 {
     return impl_->height;
+}
+
+EncoderDiagnostics H264Encoder::Diagnostics() const
+{
+    return impl_->diagnostics;
 }
 
 } // namespace od

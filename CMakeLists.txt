@@ -22,7 +22,9 @@ add_executable(opendisplay-win
   src/net/Protocol.cpp
   src/net/Mdns.cpp
   src/net/NetworkSafety.cpp
+  src/net/NeighborDiscovery.cpp
   src/encode/AnnexB.cpp
+  src/encode/VideoColor.cpp
   src/encode/H264Encoder.cpp
   src/display/VirtualDisplay.cpp
   src/display/DesktopDuplication.cpp
@@ -102,11 +104,64 @@ if(BUILD_TESTING)
     src/app/DeviceCoordinator.cpp
     src/net/Mdns.cpp
     src/net/NetworkSafety.cpp
+    src/net/NeighborDiscovery.cpp
   )
   target_include_directories(device-flow-tests PRIVATE src)
   target_link_libraries(device-flow-tests PRIVATE ws2_32 iphlpapi ole32)
   target_compile_options(device-flow-tests PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME device-flow COMMAND device-flow-tests)
+
+  add_executable(panel-layout-tests tests/panel_layout_tests.cpp)
+  target_include_directories(panel-layout-tests PRIVATE src)
+  target_compile_options(panel-layout-tests PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME panel-layout COMMAND panel-layout-tests)
+
+  add_executable(panel-scroll-tests tests/panel_scroll_tests.cpp)
+  target_include_directories(panel-scroll-tests PRIVATE src)
+  target_compile_options(panel-scroll-tests PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(panel-scroll-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  add_test(NAME panel-scroll COMMAND panel-scroll-tests)
+
+  add_executable(video-color-tests tests/video_color_tests.cpp src/encode/VideoColor.cpp src/encode/AnnexB.cpp)
+  target_include_directories(video-color-tests PRIVATE src)
+  target_compile_options(video-color-tests PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME video-color COMMAND video-color-tests)
+
+  add_executable(connection-tests tests/connection_tests.cpp src/net/Connection.cpp src/net/UsbMux.cpp)
+  target_include_directories(connection-tests PRIVATE src)
+  target_compile_options(connection-tests PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(connection-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(connection-tests PRIVATE ws2_32)
+  add_test(NAME connection-deadlines COMMAND connection-tests)
+  set_tests_properties(connection-deadlines PROPERTIES TIMEOUT 20)
+
+  add_executable(network-safety-tests tests/network_safety_tests.cpp src/net/NetworkSafety.cpp)
+  target_include_directories(network-safety-tests PRIVATE src)
+  target_compile_options(network-safety-tests PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(network-safety-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(network-safety-tests PRIVATE ws2_32 iphlpapi ole32)
+  add_test(NAME network-safety COMMAND network-safety-tests)
+  set_tests_properties(network-safety PROPERTIES TIMEOUT 15)
+
+  add_executable(encoder-color-roundtrip-tests tests/encoder_color_roundtrip_tests.cpp
+    src/encode/H264Encoder.cpp src/encode/AnnexB.cpp src/encode/VideoColor.cpp)
+  target_include_directories(encoder-color-roundtrip-tests PRIVATE src)
+  target_compile_options(encoder-color-roundtrip-tests PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(encoder-color-roundtrip-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(encoder-color-roundtrip-tests PRIVATE mfplat mf mfuuid ole32 oleaut32)
+  add_test(NAME encoder-color-roundtrip COMMAND encoder-color-roundtrip-tests)
+  set_tests_properties(encoder-color-roundtrip PROPERTIES TIMEOUT 60)
+
+  get_target_property(sender_test_sources opendisplay-win SOURCES)
+  list(REMOVE_ITEM sender_test_sources src/main.cpp src/app/TrayApp.cpp src/app/resources.rc)
+  add_executable(sender-candidates-tests tests/sender_candidates_tests.cpp ${sender_test_sources})
+  target_include_directories(sender-candidates-tests PRIVATE src third_party/parsec-vdd)
+  target_compile_options(sender-candidates-tests PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(sender-candidates-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(sender-candidates-tests PRIVATE ws2_32 user32 d3d11 dxgi dxguid mfplat mf mfreadwrite
+    mfuuid setupapi cfgmgr32 shell32 gdi32 msimg32 dwmapi ole32 iphlpapi)
+  add_test(NAME sender-candidates COMMAND sender-candidates-tests)
+  set_tests_properties(sender-candidates PROPERTIES TIMEOUT 40)
 endif()
 
 # asInvoker (not requireAdministrator): the app runs un-elevated. The only

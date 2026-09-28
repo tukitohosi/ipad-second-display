@@ -30,9 +30,3 @@ __pycache__/
 *.VC.opendb
 Thumbs.db
 Desktop.ini
-
-# Machine-specific receiver configuration and credentials.
-config.json
-config.json.bak
-*.pem
-*.key

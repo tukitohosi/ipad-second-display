@@ -4,7 +4,7 @@
 #define MyAppName "iPad互联"
 #define MyAppExeName "iPad互联.exe"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.3.0-preview"
 #endif
 
 ; SourcePath 是本 .iss 所在目录。保留这个相对布局，使中文和含空格的工程路径也可用。
@@ -29,7 +29,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 OutputDir={#ProjectRoot}\dist
-OutputBaseFilename=iPad互联-Setup-x64
+OutputBaseFilename=iPad互联-{#MyAppVersion}-Setup-x64
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

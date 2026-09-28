@@ -1,7 +1,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <charconv>
+#include <cstdint>
+#include <cwchar>
+#include <limits>
+#include <string_view>
 #include <fcntl.h>
+#include <filesystem>
+#include <iterator>
 #include <io.h>
 #include <string>
 #include <utility>
@@ -12,8 +19,10 @@
 #include <mfapi.h>
 
 #pragma comment(lib, "mfplat.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "app/SenderApp.h"
+#include "app/Config.h"
 #include "app/TrayApp.h"
 #include "display/DisplayCatalog.h"
 #include "display/VirtualDisplay.h"
@@ -28,14 +37,15 @@ namespace {
 // `name` is the log's file name: the tray owns log.txt, while a headless CLI
 // sender gets its own log-<pid>.txt. Both open CREATE_ALWAYS, so without the
 // split a second process would truncate the first one's log out from under it.
-void RedirectLogToFile(const std::string& name)
+void RedirectLogToFile(const std::string& name, bool preview = false)
 {
-    wchar_t* appdata = nullptr;
-    size_t len = 0;
-    if (_wdupenv_s(&appdata, &len, L"APPDATA") != 0 || appdata == nullptr)
-        return;
-    std::wstring dir = std::wstring(appdata) + L"\\MouseLink";
-    free(appdata);
+    std::wstring dir = std::filesystem::path(od::Config::FilePath()).parent_path().wstring();
+    if (preview) {
+        wchar_t temp[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp) == 0)
+            return;
+        dir = std::wstring(temp) + L"iPadConnect-preview";
+    }
 
     CreateDirectoryW(dir.c_str(), nullptr); // no-op if it already exists
     std::wstring wideName(name.begin(), name.end()); // log names are fixed ASCII
@@ -130,6 +140,41 @@ LONG WINAPI CrashLogger(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER; // let the process terminate
 }
 
+// An elevated replacement waits for the exact launching process to finish.
+// PID reuse is rejected using the creation time, and unrelated programs cannot
+// be used as a handoff parent. The normal single-instance gate still runs next.
+bool WaitForResumeParent(int argc, char** argv)
+{
+    if (argc < 4) return false;
+    const auto parse = [](const char* text, uint64_t& value) {
+        const std::string_view input(text);
+        const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
+        return !input.empty() && result.ec == std::errc{} && result.ptr == input.data() + input.size();
+    };
+    uint64_t parentValue = 0, expectedCreation = 0;
+    if (!parse(argv[2], parentValue) || !parse(argv[3], expectedCreation) || parentValue == 0 ||
+        parentValue > (std::numeric_limits<DWORD>::max)() || expectedCreation == 0 || parentValue == GetCurrentProcessId())
+        return false;
+    HANDLE parent = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(parentValue));
+    if (parent == nullptr) {
+        // The parent can complete its shutdown before the elevated child runs.
+        // Re-enter the ordinary mutex gate in that case; never bypass it.
+        return GetLastError() == ERROR_INVALID_PARAMETER;
+    }
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    const bool gotTimes = GetProcessTimes(parent, &creation, &exit, &kernel, &user) != FALSE;
+    const uint64_t actualCreation = (static_cast<uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    wchar_t parentPath[32768]{}, currentPath[32768]{};
+    DWORD parentPathLength = static_cast<DWORD>(std::size(parentPath));
+    const DWORD currentPathLength = GetModuleFileNameW(nullptr, currentPath, static_cast<DWORD>(std::size(currentPath)));
+    const bool identityMatches = gotTimes && actualCreation == expectedCreation &&
+        QueryFullProcessImageNameW(parent, 0, parentPath, &parentPathLength) != FALSE &&
+        currentPathLength > 0 && currentPathLength < std::size(currentPath) && _wcsicmp(parentPath, currentPath) == 0;
+    const DWORD result = identityMatches ? WaitForSingleObject(parent, 10000) : WAIT_FAILED;
+    CloseHandle(parent);
+    return result == WAIT_OBJECT_0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -142,6 +187,40 @@ int main(int argc, char** argv)
     // stable position persistence and correct input mapping on scaled displays.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    const std::string command = argc >= 2 ? argv[1] : "";
+    const bool resumeAfter = command == "--resume-after";
+    if (resumeAfter && !WaitForResumeParent(argc, argv)) return 1;
+    const bool trayMode = argc < 2 || command == "--resume" || resumeAfter;
+    struct TrayInstance {
+        HANDLE handle = nullptr;
+        ~TrayInstance() { if (handle) CloseHandle(handle); }
+    } instance;
+    if (trayMode) {
+        // Claim before opening log/config: another launch must not truncate
+        // the active sender's log or start a second discovery/connection loop.
+        instance.handle = CreateMutexW(nullptr, FALSE, L"Local\\IpadConnect.Tray.v1");
+        const DWORD error = GetLastError();
+        HWND existing = FindWindowExW(HWND_MESSAGE, nullptr, L"MouseLinkTrayWindow", nullptr);
+        // An elevated instance can deny access to its mutex; the window still
+        // accepts our narrowly allowed activation message.
+        if (!instance.handle && !existing) return 1;
+        if (error == ERROR_ALREADY_EXISTS || existing) {
+            for (int attempt = 0; !existing && attempt < 100; ++attempt) {
+                Sleep(50);
+                existing = FindWindowExW(HWND_MESSAGE, nullptr, L"MouseLinkTrayWindow", nullptr);
+            }
+            if (existing) {
+                DWORD processId = 0;
+                GetWindowThreadProcessId(existing, &processId);
+                AllowSetForegroundWindow(processId);
+                PostMessageW(existing, RegisterWindowMessageW(L"IpadConnect.ShowControlPanel.v1"), 0, 0);
+                // The earlier release understands this menu command too.
+                PostMessageW(existing, WM_COMMAND, 40009, 0);
+            }
+            return 0;
+        }
+    }
+
     // Keep COM (MTA) and Media Foundation alive for the whole process. The
     // per-connection H264Encoder does its own CoInitialize/MFStartup on its
     // worker thread and the matching CoUninitialize/MFShutdown on Stop(); with
@@ -152,7 +231,6 @@ int main(int argc, char** argv)
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
-    std::string command = argc >= 2 ? argv[1] : "";
     bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
                   command == "--remove-display" || command == "--browse-mdns" || command == "--list-displays" ||
                   command == "--list-usb";
@@ -161,8 +239,8 @@ int main(int argc, char** argv)
     // and a headless one gets its own file so two of them don't truncate each
     // other's.
     if (!oneOff || !AttachParentConsole()) {
-        bool trayMode = argc < 2 || command == "--resume" || command == "--preview-ui";
-        RedirectLogToFile(trayMode ? "log.txt" : "log-" + std::to_string(GetCurrentProcessId()) + ".txt");
+        RedirectLogToFile(trayMode ? "log.txt" : "log-" + std::to_string(GetCurrentProcessId()) + ".txt",
+                          command == "--preview-ui");
     }
 
     SetUnhandledExceptionFilter(CrashLogger);
@@ -236,9 +314,9 @@ int main(int argc, char** argv)
             od::SenderApp app;
             app.RunBlocking(argv[3], 9000, std::move(settings));
         }
-    } else if (command == "--resume") {
+    } else if (command == "--resume" || resumeAfter) {
         std::vector<std::string> addresses;
-        for (int i = 2; i < argc; ++i)
+        for (int i = resumeAfter ? 4 : 2; i < argc; ++i)
             addresses.emplace_back(argv[i]);
         rc = od::RunTray(GetModuleHandleW(nullptr), std::move(addresses));
     } else if (command == "--preview-ui") {

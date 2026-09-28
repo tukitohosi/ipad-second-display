@@ -16,11 +16,24 @@ namespace {
 // Bounds a single connect attempt so an unreachable iPad (SYN black-hole ~20s)
 // fails fast — keeps reconnect snappy and Stop()/Disconnect from hanging.
 constexpr int kConnectTimeoutMs = 3000;
+constexpr int kInterruptPollMs = 25;
+
+bool PrepareConnectedSocket(SOCKET socket)
+{
+    BOOL noDelay = TRUE;
+    setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+    // Poll readiness is advisory. Nonblocking I/O prevents a recv/send from
+    // getting stuck if readiness changes just before that call, including a
+    // concurrent Interrupt. Do this only after the usbmux handshake is done.
+    u_long nonBlocking = 1;
+    return ioctlsocket(socket, FIONBIO, &nonBlocking) == 0;
+}
 
 bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen, int timeoutMs)
 {
     u_long nonBlocking = 1;
-    ioctlsocket(s, FIONBIO, &nonBlocking);
+    if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0)
+        return false;
 
     bool ok = false;
     int r = ::connect(s, addr, addrlen);
@@ -39,7 +52,7 @@ bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen, int timeout
     }
 
     u_long blocking = 0;
-    ioctlsocket(s, FIONBIO, &blocking); // rest of the code uses blocking recv/send
+    ioctlsocket(s, FIONBIO, &blocking); // final transport setup selects nonblocking I/O
     return ok;
 }
 
@@ -50,7 +63,8 @@ Connection::~Connection()
     Close();
 }
 
-Connection::Connection(Connection&& other) noexcept : socket_(other.socket_.exchange(INVALID_SOCKET))
+Connection::Connection(Connection&& other) noexcept : socket_(other.socket_.exchange(INVALID_SOCKET)),
+    interrupted_(other.interrupted_.exchange(true))
 {
 }
 
@@ -59,6 +73,7 @@ Connection& Connection::operator=(Connection&& other) noexcept
     if (this != &other) {
         Close();
         socket_ = other.socket_.exchange(INVALID_SOCKET);
+        interrupted_ = other.interrupted_.exchange(true);
     }
     return *this;
 }
@@ -69,8 +84,10 @@ std::optional<Connection> Connection::Connect(const std::string& ip, uint16_t po
         auto socket = ConnectUsbMuxTarget(ip, port);
         if (!socket)
             return std::nullopt;
-        BOOL noDelay = TRUE;
-        setsockopt(*socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+        if (!PrepareConnectedSocket(*socket)) {
+            closesocket(*socket);
+            return std::nullopt;
+        }
         return Connection(*socket);
     }
 
@@ -101,33 +118,73 @@ std::optional<Connection> Connection::Connect(const std::string& ip, uint16_t po
     if (s == INVALID_SOCKET)
         return std::nullopt;
 
-    BOOL noDelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+    if (!PrepareConnectedSocket(s)) {
+        closesocket(s);
+        return std::nullopt;
+    }
 
     return Connection(s);
 }
 
 bool Connection::WaitWritable(int timeoutMs)
 {
+    if (timeoutMs != 0) {
+        const auto deadline = timeoutMs < 0 ? std::chrono::steady_clock::time_point::max() :
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        return WaitForSocket(POLLWRNORM, deadline);
+    }
     SOCKET socket = socket_.load();
-    if (socket == INVALID_SOCKET)
+    if (socket == INVALID_SOCKET || interrupted_.load())
         return false;
 
     WSAPOLLFD pfd{};
     pfd.fd = socket;
     pfd.events = POLLWRNORM;
-    int r = WSAPoll(&pfd, 1, timeoutMs);
-    return r > 0 && (pfd.revents & POLLWRNORM) != 0;
+    int r = WSAPoll(&pfd, 1, 0);
+    return !interrupted_.load() && r > 0 && (pfd.revents & POLLWRNORM) != 0 &&
+           (pfd.revents & (POLLERR | POLLNVAL | POLLHUP)) == 0;
 }
 
-bool Connection::ReadExact(uint8_t* buffer, size_t size)
+bool Connection::WaitForSocket(short events, std::chrono::steady_clock::time_point deadline)
+{
+    for (;;) {
+        const SOCKET socket = socket_.load();
+        if (socket == INVALID_SOCKET || interrupted_.load())
+            return false;
+        int waitMs = kInterruptPollMs;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                return false;
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            waitMs = static_cast<int>(std::clamp<int64_t>(remaining, 1, kInterruptPollMs));
+        }
+        WSAPOLLFD poll{socket, events, 0};
+        const int result = WSAPoll(&poll, 1, waitMs);
+        if (interrupted_.load() || result < 0 || (poll.revents & (POLLERR | POLLNVAL)) != 0)
+            return false;
+        if (result > 0 && (poll.revents & events) != 0)
+            return true;
+        if ((poll.revents & POLLHUP) != 0)
+            return false;
+        // A slice timeout is not the frame deadline. Recheck cancellation and
+        // remaining total time instead of restarting a prefix/payload budget.
+    }
+}
+
+bool Connection::ReadExact(uint8_t* buffer, size_t size, std::chrono::steady_clock::time_point deadline)
 {
     size_t total = 0;
     while (total < size) {
-        SOCKET socket = socket_.load();
-        if (socket == INVALID_SOCKET)
+        if (!WaitForSocket(POLLRDNORM, deadline))
             return false;
-        int n = recv(socket, reinterpret_cast<char*>(buffer + total), static_cast<int>(size - total), 0);
+        const SOCKET socket = socket_.load();
+        if (socket == INVALID_SOCKET || interrupted_.load())
+            return false;
+        const size_t chunk = std::min<size_t>(size - total, std::numeric_limits<int>::max());
+        int n = recv(socket, reinterpret_cast<char*>(buffer + total), static_cast<int>(chunk), 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+            continue;
         if (n <= 0)
             return false;
         total += static_cast<size_t>(n);
@@ -140,20 +197,16 @@ bool Connection::WriteExactUntil(const uint8_t* buffer, size_t size,
 {
     size_t total = 0;
     while (total < size) {
-        SOCKET socket = socket_.load();
-        if (socket == INVALID_SOCKET)
+        if (!WaitForSocket(POLLWRNORM, deadline))
             return false;
-
-        auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
-            return false;
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-        DWORD timeout = static_cast<DWORD>(std::clamp<int64_t>(remaining, 1, std::numeric_limits<DWORD>::max()));
-        if (setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
+        const SOCKET socket = socket_.load();
+        if (socket == INVALID_SOCKET || interrupted_.load())
             return false;
 
         size_t chunk = std::min<size_t>(size - total, static_cast<size_t>(std::numeric_limits<int>::max()));
         int n = send(socket, reinterpret_cast<const char*>(buffer + total), static_cast<int>(chunk), 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+            continue;
         if (n <= 0)
             return false;
         total += static_cast<size_t>(n);
@@ -161,13 +214,15 @@ bool Connection::WriteExactUntil(const uint8_t* buffer, size_t size,
     return true;
 }
 
-std::optional<std::vector<uint8_t>> Connection::ReadFrame()
+std::optional<std::vector<uint8_t>> Connection::ReadFrame(int timeoutMs)
 {
     if (!IsValid())
         return std::nullopt;
 
     uint8_t lenBytes[4];
-    if (!ReadExact(lenBytes, sizeof(lenBytes)))
+    const auto deadline = timeoutMs < 0 ? std::chrono::steady_clock::time_point::max() :
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    if (!ReadExact(lenBytes, sizeof(lenBytes), deadline))
         return std::nullopt;
 
     uint32_t len = (static_cast<uint32_t>(lenBytes[0]) << 24) |
@@ -184,7 +239,7 @@ std::optional<std::vector<uint8_t>> Connection::ReadFrame()
         return std::nullopt;
 
     std::vector<uint8_t> payload(len);
-    if (len > 0 && !ReadExact(payload.data(), len))
+    if (len > 0 && !ReadExact(payload.data(), len, deadline))
         return std::nullopt;
 
     return payload;
@@ -228,6 +283,7 @@ bool Connection::SendFrame(const uint8_t* data, uint32_t size, int timeoutMs)
 
 void Connection::Interrupt()
 {
+    interrupted_ = true;
     std::lock_guard<std::mutex> lock(closeMutex_);
     SOCKET socket = socket_.load();
     if (socket != INVALID_SOCKET)
@@ -236,6 +292,7 @@ void Connection::Interrupt()
 
 void Connection::Close()
 {
+    interrupted_ = true;
     std::lock_guard<std::mutex> lock(closeMutex_);
     SOCKET socket = socket_.exchange(INVALID_SOCKET);
     if (socket != INVALID_SOCKET) {

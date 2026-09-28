@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <initializer_list>
 #include <string_view>
 
 namespace od {
@@ -116,6 +117,57 @@ std::wstring DeviceEntryText(const DeviceConfig& device)
     return result;
 }
 
+std::optional<std::vector<DeviceConfig>> MergeEditedDeviceEntries(
+    const std::vector<DeviceConfig>& currentDevices, const std::vector<DeviceConfig>& baselineDevices,
+    const std::wstring& baselineText, const std::wstring& editedText, uint16_t port)
+{
+    if (port == 0) return std::nullopt;
+    auto endpoint = [](const DeviceConfig& device) -> const std::string& {
+        return device.lastIpv4.empty() ? device.bonjourHost : device.lastIpv4;
+    };
+    std::vector<DeviceConfig> merged;
+    if (editedText == baselineText) {
+        merged = currentDevices;
+    } else {
+        for (DeviceConfig edited : ParseDeviceEntriesText(editedText, port)) {
+            const DeviceConfig* baseline = nullptr;
+            for (const auto& candidate : baselineDevices) {
+                if (endpoint(candidate) != edited.lastIpv4) continue;
+                if (baseline) return std::nullopt;
+                baseline = &candidate;
+            }
+            if (baseline) {
+                const DeviceConfig* current = nullptr;
+                for (const auto& candidate : currentDevices) {
+                    const bool matches = baseline->id.empty() ? endpoint(candidate) == endpoint(*baseline) :
+                                                               candidate.id == baseline->id;
+                    if (!matches) continue;
+                    if (current) return std::nullopt;
+                    current = &candidate;
+                }
+                if (!current) return std::nullopt;
+                const std::string baselineName = baseline->name.empty() ? endpoint(*baseline) : baseline->name;
+                const bool renamed = edited.name != baselineName;
+                const std::string newName = edited.name == edited.lastIpv4 ? std::string{} : edited.name;
+                edited = *current; // preserve the current IP and verified identity, not the stale displayed IP
+                if (renamed) edited.name = newName;
+            }
+            // A user-entered endpoint absent from the displayed baseline remains
+            // a new entry. Never infer identity from its name or list position.
+            const bool conflict = std::any_of(merged.begin(), merged.end(), [&](const DeviceConfig& other) {
+                return (!edited.id.empty() && other.id == edited.id) || endpoint(other) == endpoint(edited);
+            });
+            if (conflict) return std::nullopt;
+            merged.push_back(std::move(edited));
+        }
+    }
+    for (size_t i = 0; i < merged.size(); ++i) {
+        merged[i].port = port;
+        merged[i].priority = static_cast<uint32_t>(i);
+    }
+    return merged;
+}
+
 namespace {
 
 bool IsIpv4(std::string_view value)
@@ -149,6 +201,38 @@ std::string RedactDiagnosticsText(std::string text, const std::string& userProfi
     if (!userProfile.empty()) {
         for (size_t pos = text.find(userProfile); pos != std::string::npos; pos = text.find(userProfile, pos + 9))
             text.replace(pos, userProfile.size(), "<profile>");
+    }
+
+    // Network scopes contain GUIDs; both those and receiver UUIDs must stay out
+    // of a shareable report. MACs include Apple private addresses as well.
+    auto hexadecimalPattern = [&](size_t start, std::initializer_list<size_t> groups, char separator) {
+        if (start > 0 && std::isxdigit(static_cast<unsigned char>(text[start - 1]))) return size_t{0};
+        size_t cursor = start;
+        size_t group = 0;
+        for (const size_t width : groups) {
+            for (size_t i = 0; i < width; ++i) {
+                if (cursor >= text.size() || !std::isxdigit(static_cast<unsigned char>(text[cursor]))) return size_t{0};
+                ++cursor;
+            }
+            if (++group < groups.size() && (cursor >= text.size() || text[cursor++] != separator)) return size_t{0};
+        }
+        if (cursor < text.size() && std::isxdigit(static_cast<unsigned char>(text[cursor]))) return size_t{0};
+        return cursor - start;
+    };
+    for (size_t pos = 0; pos < text.size();) {
+        size_t length = hexadecimalPattern(pos, {8, 4, 4, 4, 12}, '-');
+        const char* replacement = "<id>";
+        if (!length) {
+            length = hexadecimalPattern(pos, {2, 2, 2, 2, 2, 2}, ':');
+            if (!length) length = hexadecimalPattern(pos, {2, 2, 2, 2, 2, 2}, '-');
+            replacement = "<mac>";
+        }
+        if (length) {
+            text.replace(pos, length, replacement);
+            pos += std::char_traits<char>::length(replacement);
+        } else {
+            ++pos;
+        }
     }
 
     for (size_t start = 0; start < text.size();) {

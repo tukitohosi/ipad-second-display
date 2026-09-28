@@ -1,4 +1,4 @@
-鼠标互联 - Third-Party Notices
+iPad互联 - Third-Party Notices
 ====================================
 
 This distribution contains source code derived from or interoperating with

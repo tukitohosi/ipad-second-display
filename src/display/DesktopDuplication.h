@@ -10,6 +10,14 @@
 
 namespace od {
 
+struct CaptureTimings {
+    double waitMs = -1.0;
+    double readbackMs = -1.0;
+    double cursorMs = -1.0;
+    double conversionMs = -1.0;
+    bool frameCaptured = false;
+};
+
 // Captures the virtual monitor's output via DXGI Desktop Duplication and
 // converts BGRA -> NV12 (the encoder's required input format) on the CPU.
 class DesktopDuplication {
@@ -34,6 +42,9 @@ public:
 
     uint32_t Width() const { return width_; }
     uint32_t Height() const { return height_; }
+    // Read on the capture thread, or under its pipeline lock. A negative
+    // duration means the stage was not reached on the most recent call.
+    CaptureTimings LastTimings() const { return timings_; }
 
 private:
     // DXGI delivers the mouse cursor out-of-band (it is NOT baked into the
@@ -57,6 +68,7 @@ private:
     bool reportedLoss_ = false; // throttles the "lost, rebuilding" log to once per teardown
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    CaptureTimings timings_;
 
     std::vector<uint8_t> pointerShape_;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO pointerShapeInfo_{};

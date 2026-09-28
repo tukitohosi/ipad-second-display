@@ -174,11 +174,16 @@ void SenderApp::Start(std::string ip, uint16_t port, StreamSettings settings,
         receiverStalls_ = -1;
         captureMs_ = -1.0;
         encodeMs_ = -1.0;
+        pipeline_ = {};
+        metricsStarted_ = std::chrono::steady_clock::now();
+        metricsOutputFrames_ = 0;
         displayName_.clear();
+        connectedAddress_.clear();
         deviceId_ = expectedDeviceId;
         transport_ = transport;
         ++attempt_;
     }
+    UpdateConnectionCandidates(settings.candidateTargets.empty() ? std::vector<std::string>{ip} : settings.candidateTargets);
     PublishStatus(ConnectionPhase::Connecting);
     worker_ = std::thread(
         [this, ip = std::move(ip), port, settings = std::move(settings),
@@ -186,6 +191,18 @@ void SenderApp::Start(std::string ip, uint16_t port, StreamSettings settings,
             RunLoop(std::move(ip), port, std::move(settings), std::move(expectedDeviceId), std::move(transport));
             running_ = false;
         });
+}
+
+void SenderApp::UpdateConnectionCandidates(std::vector<std::string> targets)
+{
+    std::vector<std::string> unique;
+    for (auto& target : targets) {
+        if (!target.empty() && std::find(unique.begin(), unique.end(), target) == unique.end())
+            unique.push_back(std::move(target));
+        if (unique.size() == 8) break;
+    }
+    std::lock_guard<std::mutex> lock(candidatesMutex_);
+    candidateTargets_ = std::move(unique);
 }
 
 void SenderApp::RequestStop()
@@ -217,6 +234,7 @@ void SenderApp::Stop()
 void SenderApp::RunBlocking(std::string ip, uint16_t port, StreamSettings settings)
 {
     const std::string transport = IsUsbMuxTarget(ip) ? "usb" : "wifi";
+    UpdateConnectionCandidates(settings.candidateTargets.empty() ? std::vector<std::string>{ip} : settings.candidateTargets);
     running_ = true;
     RunLoop(std::move(ip), port, std::move(settings), {}, transport);
     running_ = false;
@@ -275,14 +293,39 @@ void SenderApp::PublishReceiverStats(const std::string& json)
         receiverStalls_ = static_cast<int>(*value);
 }
 
-void SenderApp::PublishPipelineTimings(double captureMs, std::optional<double> encodeMs)
+void SenderApp::PublishPipelineTimings(const CaptureTimings& capture, const EncoderDiagnostics& encoder,
+                                      std::optional<double> encodeMs)
 {
     std::lock_guard<std::mutex> lock(statusMutex_);
-    // A light exponential average is enough for diagnostics and avoids a
-    // per-frame history allocation in the hot path.
-    captureMs_ = captureMs_ < 0.0 ? captureMs : captureMs_ * 0.9 + captureMs * 0.1;
+    auto smooth = [](double& value, double sample) {
+        if (sample >= 0) value = value < 0 ? sample : value * 0.9 + sample * 0.1;
+    };
+    smooth(pipeline_.waitMs, capture.waitMs);
+    smooth(pipeline_.readbackMs, capture.readbackMs);
+    smooth(pipeline_.cursorMs, capture.cursorMs);
+    smooth(pipeline_.conversionMs, capture.conversionMs);
+    if (capture.frameCaptured)
+        smooth(captureMs_, std::max(0.0, capture.readbackMs) + std::max(0.0, capture.cursorMs) +
+                           std::max(0.0, capture.conversionMs));
     if (encodeMs)
-        encodeMs_ = encodeMs_ < 0.0 ? *encodeMs : encodeMs_ * 0.9 + *encodeMs * 0.1;
+        smooth(encodeMs_, *encodeMs);
+    smooth(pipeline_.bufferCopyMs, encoder.lastCopyMs);
+    smooth(pipeline_.outputDelayMs, encoder.lastOutputDelayMs);
+    pipeline_.encoderName = encoder.name;
+    pipeline_.hardware = encoder.hardware;
+    pipeline_.colorVerified = encoder.colorSignalingVerified;
+    pipeline_.outputFrames = encoder.outputFrames;
+    const auto now = std::chrono::steady_clock::now();
+    if (encoder.outputFrames < metricsOutputFrames_ || metricsStarted_ == std::chrono::steady_clock::time_point{}) {
+        metricsStarted_ = now;
+        metricsOutputFrames_ = encoder.outputFrames;
+    }
+    const double seconds = std::chrono::duration<double>(now - metricsStarted_).count();
+    if (seconds >= 2.0) {
+        pipeline_.outputFps = static_cast<double>(encoder.outputFrames - metricsOutputFrames_) / seconds;
+        metricsStarted_ = now;
+        metricsOutputFrames_ = encoder.outputFrames;
+    }
 }
 
 ConnectionSnapshot SenderApp::Snapshot() const
@@ -301,8 +344,14 @@ ConnectionSnapshot SenderApp::Snapshot() const
     snapshot.receiverStalls = receiverStalls_;
     snapshot.captureMs = captureMs_;
     snapshot.encodeMs = encodeMs_;
+    snapshot.pipeline = pipeline_;
     snapshot.displayName = displayName_;
     snapshot.deviceId = deviceId_;
+    snapshot.connectedAddress = connectedAddress_;
+    {
+        std::lock_guard<std::mutex> candidateLock(candidatesMutex_);
+        snapshot.candidateCount = static_cast<uint32_t>(std::max<size_t>(1, candidateTargets_.size()));
+    }
     snapshot.transport = transport_;
     snapshot.attempt = attempt_;
     if (retryAt_ != std::chrono::steady_clock::time_point{}) {
@@ -348,6 +397,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                       "已有另一个 iPad互联进程连接这台设备");
         return;
     }
+    struct ConnectionGuard {
+        HANDLE handle;
+        ~ConnectionGuard() { if (handle) CloseHandle(handle); }
+    } connectionGuard{ipLock};
 
     // Declaration order matters for teardown: H264Encoder's ctor initializes
     // COM (MTA) + Media Foundation for this thread and its dtor uninitializes
@@ -470,6 +523,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
     bool everStreamed = false;
     std::string lastNetworkBlockReason;
     std::optional<std::chrono::steady_clock::time_point> disconnectedSince;
+    const bool usbTarget = IsUsbMuxTarget(ip);
+    const std::string initialTarget = ip;
+    std::string lastSuccessfulTarget;
+    std::vector<std::string> attemptedTargets;
+    bool roundHadPermittedTarget = false;
+    FailureReason lastCandidateFailure = FailureReason::ReceiverUnavailable;
+    std::string lastCandidateDetail;
 
     while (!stopRequested_) {
         if (disconnectedSince &&
@@ -480,23 +540,57 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
             disconnectedSince.reset();
         }
 
+        if (!usbTarget) {
+            std::vector<std::string> candidates;
+            {
+                std::lock_guard<std::mutex> lock(candidatesMutex_);
+                candidates = candidateTargets_;
+            }
+            if (candidates.empty()) candidates.push_back(initialTarget);
+            if (!lastSuccessfulTarget.empty()) {
+                candidates.erase(std::remove(candidates.begin(), candidates.end(), lastSuccessfulTarget), candidates.end());
+                candidates.insert(candidates.begin(), lastSuccessfulTarget);
+            }
+            const auto next = std::find_if(candidates.begin(), candidates.end(), [&](const auto& target) {
+                return std::find(attemptedTargets.begin(), attemptedTargets.end(), target) == attemptedTargets.end();
+            });
+            // One bounded attempt per endpoint before retrying a device. The
+            // tray observes Failed and may advance to its next device.
+            if (next == candidates.end() || attemptedTargets.size() >= 8) {
+                state_ = roundHadPermittedTarget ? State::Connecting : State::UnsafeNetwork;
+                PublishStatus(roundHadPermittedTarget ? ConnectionPhase::Failed : ConnectionPhase::UnsafeNetwork,
+                              roundHadPermittedTarget ? lastCandidateFailure : FailureReason::NetworkUnsafe,
+                              lastCandidateDetail.empty() ? "已尝试所有设备地址，请确认 OpenDisplay 保持前台" : lastCandidateDetail,
+                              kReconnectDelayMs);
+                InterruptibleSleep(kReconnectDelayMs);
+                attemptedTargets.clear();
+                roundHadPermittedTarget = false;
+                continue;
+            }
+            ip = *next;
+            attemptedTargets.push_back(ip);
+        }
+
         // Re-check before every connection attempt. A laptop can roam from a
         // trusted hotspot to public Wi-Fi while this process stays running;
         // a one-time startup check would otherwise permit the reconnect.
         NetworkSafetyResult networkSafety = IsUsbMuxTarget(ip)
                                               ? NetworkSafetyResult{true, "direct USB cable", ip}
-                                              : CheckTrustedLan(ip, settings.requirePrivateNetwork);
+                                              : CheckTrustedLan(ip, settings.requirePrivateNetwork, &stopRequested_);
+        if (stopRequested_) break;
         if (!networkSafety.allowed) {
-            state_ = State::UnsafeNetwork;
-            PublishStatus(ConnectionPhase::UnsafeNetwork, FailureReason::NetworkUnsafe, networkSafety.reason,
-                          kBlockedRetryMs);
+            lastCandidateDetail = networkSafety.reason;
+            lastCandidateFailure = networkSafety.resolutionFailed ? FailureReason::ReceiverUnavailable : FailureReason::NetworkUnsafe;
+            if (networkSafety.resolutionFailed) roundHadPermittedTarget = true;
+            PublishStatus(ConnectionPhase::Connecting, lastCandidateFailure, networkSafety.reason);
             if (networkSafety.reason != lastNetworkBlockReason) {
                 lastNetworkBlockReason = networkSafety.reason;
                 Logf(ip, "connection blocked by trusted-LAN policy: %s\n", networkSafety.reason.c_str());
             }
-            InterruptibleSleep(kBlockedRetryMs);
+            if (usbTarget) InterruptibleSleep(kBlockedRetryMs);
             continue;
         }
+        roundHadPermittedTarget = true;
         if (!lastNetworkBlockReason.empty()) {
             Logf(ip, "network safety restored: %s\n", networkSafety.reason.c_str());
             lastNetworkBlockReason.clear();
@@ -516,11 +610,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                 PublishStatus(ConnectionPhase::Reconnecting, FailureReason::UsbUnavailable, UsbMuxLastError(),
                               kReconnectDelayMs);
             } else {
-                Logf(ip, "connect failed, retrying in %dms\n", kReconnectDelayMs);
+                lastCandidateFailure = FailureReason::ReceiverUnavailable;
+                lastCandidateDetail = "设备地址无法连接，正在检查其他已知地址";
+                Logf(ip, "connect failed; trying the next known address\n");
                 PublishStatus(ConnectionPhase::Reconnecting, FailureReason::ReceiverUnavailable,
                               "无法连接 iPad；请在前台打开 OpenDisplay", kReconnectDelayMs);
             }
-            InterruptibleSleep(kReconnectDelayMs);
+            if (usbTarget) InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
         ActiveConn activeConn(this, &*conn);
@@ -530,8 +626,12 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
 
         HelloMsg hello;
         bool gotHello = false;
+        const auto helloDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (!gotHello && !stopRequested_) {
-            auto frame = conn->ReadFrame();
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                helloDeadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
+            auto frame = conn->ReadFrame(static_cast<int>(remaining));
             if (!frame)
                 break;
             if (!IsControlPayload(frame->data(), frame->size()))
@@ -543,6 +643,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
             }
         }
         if (!gotHello) {
+            lastCandidateFailure = FailureReason::OpenDisplayUnavailable;
+            lastCandidateDetail = "未收到 OpenDisplay 握手；请让接收端保持前台";
             PublishStatus(ConnectionPhase::Reconnecting, FailureReason::OpenDisplayUnavailable,
                           "未收到 OpenDisplay 握手；请让接收端保持前台", kReconnectDelayMs);
             continue;
@@ -550,13 +652,19 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
         if (!HelloMatchesExpectedDevice(hello, expectedDeviceId)) {
             Logf(ip, "refusing receiver identity mismatch (expected stable id, hello.id differs)\n");
             conn->Close();
-            PublishStatus(ConnectionPhase::Failed, FailureReason::DeviceIdentityMismatch,
-                          "当前地址返回了另一台设备，已拒绝连接");
-            return;
+            lastCandidateFailure = FailureReason::DeviceIdentityMismatch;
+            lastCandidateDetail = "当前地址返回了另一台设备，已拒绝连接并继续检查其他地址";
+            PublishStatus(ConnectionPhase::Connecting, lastCandidateFailure, lastCandidateDetail);
+            if (usbTarget) return;
+            continue;
         }
+        // Once learned, an unbound manual entry must still reconnect only to
+        // this receiver, even if DHCP reassigns its old address mid-session.
+        if (expectedDeviceId.empty() && !hello.id.empty()) expectedDeviceId = hello.id;
         {
             std::lock_guard<std::mutex> statusLock(statusMutex_);
             deviceId_ = hello.id;
+            connectedAddress_ = networkSafety.resolvedTarget.empty() ? ip : networkSafety.resolvedTarget;
         }
 
         // Version handshake (receiver protocol 3+): the iPad only sends
@@ -642,9 +750,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
         state_ = State::Streaming;
         PublishStatus(ConnectionPhase::Streaming);
         everStreamed = true;
+        lastSuccessfulTarget = networkSafety.resolvedTarget.empty() ? ip : networkSafety.resolvedTarget;
+        attemptedTargets.clear();
+        roundHadPermittedTarget = false;
         disconnectedSince.reset();
 
         std::atomic<bool> running{true};
+        bool encoderColorFailure = false;
         std::atomic<bool> receiverSleeping{false};
         std::atomic<bool> receiverClosing{false};
         std::atomic<bool> keyFrameRequested{false};
@@ -774,6 +886,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
 
         std::vector<uint8_t> nv12;
         auto lastSend = std::chrono::steady_clock::now();
+        auto lastMetricsLog = lastSend;
         auto lastPing = std::chrono::steady_clock::now();
         auto lastNetworkCheck = std::chrono::steady_clock::now();
         auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
@@ -794,10 +907,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
 
         while (running && !stopRequested_) {
             auto loopNow = std::chrono::steady_clock::now();
-        if (loopNow - lastNetworkCheck >= std::chrono::milliseconds(kSenderPingMs)) {
+            if (loopNow - lastNetworkCheck >= std::chrono::milliseconds(kSenderPingMs)) {
                 NetworkSafetyResult liveSafety = IsUsbMuxTarget(ip)
                                                     ? NetworkSafetyResult{true, "direct USB cable"}
-                                                    : CheckTrustedLan(ip, settings.requirePrivateNetwork);
+                                                    : CheckTrustedLan(networkSafety.resolvedTarget, settings.requirePrivateNetwork, &stopRequested_);
                 lastNetworkCheck = loopNow;
                 if (!liveSafety.allowed) {
                     Logf(ip, "stopping stream because trusted-LAN policy changed: %s\n", liveSafety.reason.c_str());
@@ -856,11 +969,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                 nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
                 // CaptureFrameNv12 returns false on a pure timeout (nothing on
                 // screen or cursor changed since last time).
-                const auto captureStarted = std::chrono::steady_clock::now();
                 bool changed = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(settings.fps));
-                const double captureMs = std::chrono::duration<double, std::milli>(
-                                             std::chrono::steady_clock::now() - captureStarted)
-                                             .count();
 
                 // Rotation or a resolution change made on the Windows side
                 // never sends a `hello`, so nothing rebuilds the pipeline: the
@@ -981,11 +1090,21 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                                    std::chrono::steady_clock::now() - encodeStarted)
                                    .count();
                 }
-                PublishPipelineTimings(captureMs, encodeMs);
+                const auto encoderStats = encoder.Diagnostics();
+                PublishPipelineTimings(dup.LastTimings(), encoderStats, encodeMs);
+                if (encoderStats.spsRejected > 0) {
+                    encoded.clear();
+                    encoderColorFailure = true;
+                    running = false;
+                    PublishStatus(ConnectionPhase::Failed, FailureReason::EncoderUnavailable,
+                                  "编码器输出了无法验证的 H.264 色彩信息，已停止传输");
+                }
             }
 
             bool sentSomething = false;
-            for (auto& f : encoded) {
+            for (size_t frameIndex = 0; frameIndex < encoded.size(); ++frameIndex) {
+                auto& f = encoded[frameIndex];
+                const auto sendStarted = std::chrono::steady_clock::now();
                 // Backpressure: if the socket can't take data within the
                 // budget, drop the whole frame (never a partial write — that
                 // would desync the receiver's framing) and force a keyframe
@@ -1013,8 +1132,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                         // that stays congested this would otherwise be the
                         // loudest line in the log.
                         Logf(ip, "send backpressure, dropped a frame\n");
+                    }
+                    {
                         std::lock_guard<std::mutex> statusLock(statusMutex_);
-                        ++networkDrops_;
+                        networkDrops_ += encoded.size() - frameIndex;
                     }
                     break;
                 }
@@ -1026,6 +1147,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                     break;
                 }
                 sentSomething = true;
+                {
+                    const double elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - sendStarted).count();
+                    std::lock_guard<std::mutex> statusLock(statusMutex_);
+                    pipeline_.sendMs = pipeline_.sendMs < 0 ? elapsed : pipeline_.sendMs * 0.9 + elapsed * 0.1;
+                    ++pipeline_.sentFrames;
+                }
                 dropPending = false;
                 if (f.isKeyFrame)
                     Logf(ip, "sent keyframe, %zu bytes\n", f.annexB.size());
@@ -1034,6 +1162,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
                 lastSend = std::chrono::steady_clock::now();
 
             auto now = std::chrono::steady_clock::now();
+            if (now - lastMetricsLog >= std::chrono::seconds(5)) {
+                const auto stats = Snapshot();
+                const auto& p = stats.pipeline;
+                Logf(ip, "PIPELINE wait=%.2f readback=%.2f cursor=%.2f convert=%.2f copy=%.2f encodeCall=%.2f "
+                         "encodeOutput=%.2f send=%.2f ms outputFps=%.1f drops=%llu hardware=%d color709=%d\n",
+                     p.waitMs, p.readbackMs, p.cursorMs, p.conversionMs, p.bufferCopyMs, stats.encodeMs,
+                     p.outputDelayMs, p.sendMs, p.outputFps, static_cast<unsigned long long>(stats.networkDrops),
+                     p.hardware, p.colorVerified);
+                lastMetricsLog = now;
+            }
             if (running && now - lastPing >= std::chrono::milliseconds(kSenderPingMs)) {
                 std::string ping = SerializeSenderPing();
                 if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(ping.data()),
@@ -1050,22 +1188,25 @@ void SenderApp::RunLoop(std::string ip, uint16_t port, StreamSettings settings,
         input.EndSession();
         width_ = 0;
         height_ = 0;
+        state_ = State::Connecting;
+        {
+            std::lock_guard<std::mutex> lock(statusMutex_);
+            connectedAddress_.clear();
+        }
         if (receiverSleeping || receiverClosing)
             detachManagedDisplay();
         else if (!stopRequested_ && !disconnectedSince)
             disconnectedSince = std::chrono::steady_clock::now();
 
         Logf(ip, "disconnected%s\n", stopRequested_ || receiverClosing ? "" : ", reconnecting");
-        if (!stopRequested_ && !receiverClosing && !receiverSleeping)
+        if (!stopRequested_ && !receiverClosing && !receiverSleeping && !encoderColorFailure)
             PublishStatus(ConnectionPhase::Reconnecting, FailureReason::TransportError,
                           "连接已中断，正在重连原通道", kReconnectDelayMs);
-        if (receiverClosing)
+        if (receiverClosing || encoderColorFailure)
             break;
     }
 
     detachManagedDisplay();
-    if (ipLock != nullptr)
-        CloseHandle(ipLock);
     state_ = State::Idle;
     if (stopRequested_)
         PublishStatus(ConnectionPhase::Idle);

@@ -1,9 +1,5 @@
 # iPad互联
 
-简体中文 | [English](README.en.md)
-
-> 简明安装与使用说明见 [项目介绍与使用指南](项目介绍与使用指南.md)。
-
 本工程是在 `martinhoess/opendisplay-win` 提交 `06af3a9` 基础上进行的
 Windows 自用加固版本，继续兼容未经修改的 OpenDisplay iPad 接收端。
 中文安装与安全说明见 [`docs/使用说明.md`](docs/使用说明.md)，驱动共存和
@@ -12,7 +8,9 @@ Windows 自用加固版本，继续兼容未经修改的 OpenDisplay iPad 接收
 与上游原型相比，本分支支持 USB/Wi-Fi、稳定设备 ID + Bonjour 动态地址、
 按设备优先级单目标故障转移和异步快捷切换；它记忆最后成功通道但不让地址
 覆盖设备优先级，默认拒绝公用网络，补齐 OpenDisplay v3 生命周期，并禁用按
-全局数字索引删除显示器的危险维护入口。正式发行物名称为 `iPad互联.exe`。
+全局数字索引删除显示器的危险维护入口。安装后的程序名称为 `iPad互联.exe`，发行下载文件带版本号。
+
+0.3.0-preview 采用 Windows 原生副屏桌面、可重排的控制面板，以及有网络范围的 MAC 辅助寻址，配置格式升级为 v3。本版已经过本地 Release 构建、自动化测试和隔离界面预览；真实 iPad、60 分钟连续运行及干净机器安装仍待验收。安装包和便携版按版本命名，`dist` 中的旧版文件继续保留。
 
 ## Upstream technical documentation
 
@@ -30,6 +28,12 @@ protocol, so the iOS app needs no changes.
 > device switching on top of the 0.1.2 daily-use panel. It remains a
 > self-use preview and must not be treated as a broadly compatible commercial
 > display driver.
+
+Version 0.3.0-preview uses the native Windows desktop instead of the shortcut
+overlay. Configuration v3 migrates old launcher/taskbar-routing options to
+disabled while preserving device and connection settings. The Release build,
+local tests and isolated UI preview passed. Real-iPad operation, a 60-minute
+session and a clean-machine installation still need acceptance.
 
 ## How it works
 
@@ -125,7 +129,7 @@ keep the generated receipt until final acceptance and rollback are complete.
 ### 2. Install iPad互联
 
 Build this pinned source tree, or use this project's own
-`dist\iPad互联-Setup-x64.exe`. Do not repackage the older upstream v0.1.0
+`dist\iPad互联-0.3.0-preview-Setup-x64.exe`. Do not repackage the older upstream v0.1.0
 binary: it predates the protocol, lifecycle and safety fixes in this branch.
 
 **SmartScreen will warn you.** The binary is not code-signed yet, so Windows
@@ -141,10 +145,10 @@ commands.
 Double-click the exe. The main control panel opens immediately while the sender
 continues to live in the tray after the window is closed. Keep OpenDisplay in
 the iPad foreground, then choose a discovered LAN receiver or use a cable and
-click **连接**. Manual IP entry remains under **高级设置**.
+click **自动连接** or **连接所选**. Manual IP entry remains under **高级设置**.
 
 The device selector shows priority, the stable OpenDisplay install ID, mDNS
-online state, current address and the latest failure. **连接/切换** stops the old
+online state, current address and the latest failure. **连接所选** stops the old
 target asynchronously and starts exactly one selected Wi-Fi target after the
 old session has exited. **记住为默认** changes device preference; the most recent
 USB/Wi-Fi success changes only transport preference. **上移** changes automatic
@@ -164,9 +168,26 @@ here wins over the advertised one.
 Configuration is versioned at `%APPDATA%\MouseLink\config.json`. Old `ip` and
 string-array files migrate in memory, while the next save uses structured
 device records and a sibling temporary file + atomic replace + `.bak` recovery.
-MAC addresses are never used as TCP endpoints; `macHint`, when present, is
-diagnostic-only. Hostnames and numeric IPv4/IPv6 are resolved through the same
-trusted-private-network gate used for the actual socket endpoint.
+Historical `macHint` values remain diagnostic-only. New MAC bindings are learned
+only after a successful connection validates `hello.id`, and are scoped to the
+actual Windows network GUID plus adapter GUID. Candidate endpoints are tried in
+order: online Bonjour addresses for the stable ID, IP addresses matching a
+verified MAC on this network, Bonjour hostname, then the saved IP. All candidates
+still use IP/TCP, the trusted-network gate and receiver-ID validation.
+
+Neighbor discovery reads the Windows cache and may refresh a bounded set of
+already-known numeric on-link addresses; it does not scan the subnet or promise
+an inventory of all devices. Missing/stale neighbors, routing and client isolation
+can prevent MAC lookup. Apple private Wi-Fi addresses may change: keep the privacy
+feature enabled and let a subsequent verified connection update the association.
+MAC addresses are never socket endpoints or authentication, and USB continues to
+use its own device identifier. See [Apple's private-address documentation](https://support.apple.com/en-us/102509).
+
+The secondary screen uses Explorer's native desktop, icons, context menus and
+Windows taskbar behavior. Windows does not automatically duplicate every primary
+desktop icon on an extended display. Scaling remains a normal per-display Windows
+setting. The H.264 video path is compressed; native desktop behavior is not a
+claim of lossless video, zero latency or full HDR support.
 
 **One panel size at a time.** parsec-vdd puts a single custom resolution on all
 of its virtual monitors, so iPads with *different* panels cannot both run
@@ -241,8 +262,8 @@ build\Release\iPad互联.exe
 
 Launched **with an IP** it runs **headless** (no UI), handy for a single-target
 test. It logs to its own `log-<pid>.txt`. Do not run several product processes
-in parallel: panel-size coordination is process-local. Configure several
-same-size iPads in one tray process instead.
+in parallel: panel-size coordination is process-local. Multiple configured
+iPads are ordered fallback targets; this version streams to one target at a time.
 
 ```
 build\Release\iPad互联.exe <ipad-ip>
@@ -256,6 +277,21 @@ only to print a refusal message. Use the receipt-validated safety tools for any
 driver recovery.
 
 ## Testing without an iPad
+
+Start with `build\Release\iPad互联.exe --preview-ui` to inspect the panel without
+connecting a receiver or creating a display. Preview uses isolated defaults,
+does not read/save the real configuration, and writes its log to a temporary
+directory. Check small windows, long device names, scrolling and multiple DPI
+scales before device testing. An absolute `IPAD_CONNECT_CONFIG_DIR` may explicitly
+redirect configuration for other isolated tests; an empty test directory never
+migrates a real legacy configuration.
+
+The `sender-candidates` CTest target uses only specific `127.0.0.x` listeners at
+temporary ports. It exercises missing/partial hello deadlines, identity mismatch,
+live candidate refresh and stopping. A matching test hello always advertises an
+invalid `1x1` panel, so the test cannot enter display creation. These checks do not
+prove real-network MAC discovery, actual iPad color/clarity or driver acceptance;
+record those separately using [`docs/实机验收.md`](docs/实机验收.md).
 
 `tools/mock_receiver.py` (Python 3, stdlib only) stands in for the iPad:
 listens on :9000, sends `hello`, logs control messages, and structurally
@@ -273,10 +309,8 @@ build\Release\iPad互联.exe --capture-existing "\\.\DISPLAY1" 127.0.0.1
 after N frames, i.e. what the iPad sends when it is turned — the path where the
 sender tears its virtual monitor down and has to claim a new one.
 
-Two iPads at once can be faked over the loopback range: bind one mock to
-`127.0.0.1` and another to `127.0.0.2` (`--host`), then start a sender against
-each. Both senders must end up on **different** `\\.\DISPLAYn` monitors — the
-`claimed virtual monitor` line in the log says which.
+Multiple mock receivers can test candidate ordering and failover on loopback.
+The 0.3.0-preview application streams to one selected target at a time.
 
 ## License
 

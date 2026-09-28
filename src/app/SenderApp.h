@@ -7,17 +7,29 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <windows.h>
 
 namespace od {
 
 class Connection;
+struct CaptureTimings;
+struct EncoderDiagnostics;
+
+struct PipelineMetrics {
+    double waitMs = -1, readbackMs = -1, cursorMs = -1, conversionMs = -1;
+    double bufferCopyMs = -1, outputDelayMs = -1, outputFps = -1, sendMs = -1;
+    uint64_t outputFrames = 0, sentFrames = 0;
+    std::wstring encoderName;
+    bool hardware = false, colorVerified = false;
+};
 
 struct StreamSettings {
     uint32_t fps = 60;
     uint32_t bitrateBps = 30'000'000;
     bool requirePrivateNetwork = true;
+    std::vector<std::string> candidateTargets;
 
     // Empty: create and own a Parsec virtual display (normal product mode).
     // Non-empty: capture that already-attached \\.\DISPLAYn read-only. This is
@@ -61,6 +73,8 @@ enum class FailureReason {
 
 struct ConnectionSnapshot {
     std::string deviceId;
+    std::string connectedAddress;
+    uint32_t candidateCount = 1;
     std::string transport;
     uint32_t attempt = 0;
     ConnectionPhase phase = ConnectionPhase::Idle;
@@ -76,6 +90,7 @@ struct ConnectionSnapshot {
     int receiverStalls = -1;
     double captureMs = -1.0;
     double encodeMs = -1.0;
+    PipelineMetrics pipeline;
     std::wstring displayName;
 };
 
@@ -104,6 +119,8 @@ public:
     // Non-blocking half of Stop, for UI command/switch paths. The UI can poll
     // IsRunning and start the replacement only after the old worker exits.
     void RequestStop();
+    // Discovery can refresh these while streaming; only reconnect uses them.
+    void UpdateConnectionCandidates(std::vector<std::string> targets);
 
     // Signal stop and join the worker. Safe to call when not running.
     void Stop();
@@ -134,7 +151,8 @@ private:
                        std::string detail = {}, int retryInMs = 0);
     void PublishDisplayName(std::wstring name);
     void PublishReceiverStats(const std::string& json);
-    void PublishPipelineTimings(double captureMs, std::optional<double> encodeMs);
+    void PublishPipelineTimings(const CaptureTimings& capture, const EncoderDiagnostics& encoder,
+                                std::optional<double> encodeMs);
 
     std::thread worker_;
     std::atomic<bool> running_{false};
@@ -159,10 +177,16 @@ private:
     int receiverStalls_ = -1;
     double captureMs_ = -1.0;
     double encodeMs_ = -1.0;
+    PipelineMetrics pipeline_;
+    std::chrono::steady_clock::time_point metricsStarted_{};
+    uint64_t metricsOutputFrames_ = 0;
     std::wstring displayName_;
     std::string deviceId_;
     std::string transport_;
     uint32_t attempt_ = 0;
+    std::string connectedAddress_;
+    mutable std::mutex candidatesMutex_;
+    std::vector<std::string> candidateTargets_;
 
     // Lets Stop() close the socket the worker is currently blocked on
     // (Connect's result / ReadFrame), so a stop doesn't wait for the next
